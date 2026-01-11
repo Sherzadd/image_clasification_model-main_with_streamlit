@@ -1,7 +1,7 @@
 import json
+from pathlib import Path
 import io
 import hashlib
-from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -9,11 +9,15 @@ import tensorflow as tf
 import streamlit as st
 
 # -----------------------------
-# ✅ Paths (hidden from users)
+# ✅ Robust paths (works local + Streamlit Cloud)
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = (BASE_DIR / "models" / "image_classification_model_linux.keras").resolve()
-CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
+MODELS_DIR = (BASE_DIR / "models").resolve()
+
+
+def resolve_path(p: str) -> Path:
+    pp = Path(p).expanduser()
+    return pp if pp.is_absolute() else (BASE_DIR / pp).resolve()
 
 
 # -----------------------------
@@ -21,49 +25,42 @@ CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
 # -----------------------------
 st.set_page_config(page_title="Plant Disease Classifier", page_icon="🌿", layout="centered")
 st.title("🌿 Plant Disease Classifier")
-st.caption("Upload a leaf image and this app will predict the plant disease class using a trained TensorFlow/Keras model.")
-
+st.caption("Upload a leaf image and this app will predict the plant disease class using your trained TensorFlow/Keras model.")
 
 # -----------------------------
-# 📘 User Manual (for end users)
+# Beginner-friendly explanation
 # -----------------------------
-with st.expander("📘 User Manual (click to open)", expanded=True):
+with st.expander("📘 Beginner explanation (click to open)"):
     st.markdown(
         """
-### How to take a good photo (important)
-- Use **bright natural light** (avoid very dark photos).
-- Keep the leaf **in focus** (no blur).
-- Capture **one leaf clearly** (fill most of the frame).
-- Use a **plain background** if possible.
-- Avoid strong **shadows**, **reflections**, and **filters**.
-- Don’t crop too tightly — include the **full infected area**.
+**What happens when you upload an image?**
 
-### How to use the app
-1. Click **Take a photo** OR **Upload an image**.
-2. Wait a second until the prediction appears.
-3. Read the predicted class and confidence.
+1. **You upload** a JPG/PNG leaf photo.
+2. The app **loads your saved model**.
+3. The app **resizes** the image to the model input size (e.g., 256×256).
+4. The app runs `model.predict(...)` to get probabilities.
+5. The app shows the predicted class + confidence.
         """
     )
-
 
 # -----------------------------
 # Helper functions
 # -----------------------------
-def load_class_names(path: Path) -> list[str]:
+def load_class_names(path: str) -> list[str]:
     with open(path, "r", encoding="utf-8") as f:
         names = json.load(f)
     if not isinstance(names, list) or not names:
-        raise ValueError("class_names.json must be a non-empty JSON list.")
+        raise ValueError("class_names.json must be a non-empty JSON list, e.g. ['class1','class2',...]")
     return names
 
 
 @st.cache_resource
-def load_model_cached(model_path: str, mtime: float) -> tf.keras.Model:
-    # Cache model, refresh cache when file changes (mtime changes)
+def load_model_cached(model_path: str, mtime: float):
+    # Cache model, but refresh cache when file changes (mtime changes)
     try:
         return tf.keras.models.load_model(model_path, compile=False)
     except TypeError:
-        # some environments support safe_mode
+        # Some Keras versions support safe_mode
         return tf.keras.models.load_model(model_path, compile=False, safe_mode=False)
 
 
@@ -77,22 +74,21 @@ def model_has_rescaling_layer(model: tf.keras.Model) -> bool:
                 if _has(sub):
                     return True
         return False
-
     return _has(model)
 
 
 def preprocess(img: Image.Image, model: tf.keras.Model) -> np.ndarray:
-    """PIL -> (1,H,W,3) float32; resize to model input; avoid double-scaling."""
+    """PIL -> (1,H,W,3) float32, resized to model input. Avoid double-rescale if model already has Rescaling."""
     img = img.convert("RGB")
+    in_shape = getattr(model, "input_shape", None)
 
-    in_shape = getattr(model, "input_shape", None)  # e.g. (None, 256, 256, 3)
     if isinstance(in_shape, tuple) and len(in_shape) == 4:
         target_h, target_w = in_shape[1], in_shape[2]
         if target_h is not None and target_w is not None:
             img = img.resize((target_w, target_h), Image.BILINEAR)
 
-    x = np.array(img).astype("float32")  # (H,W,3)
-    x = np.expand_dims(x, 0)            # (1,H,W,3)
+    x = np.array(img).astype("float32")
+    x = np.expand_dims(x, 0)
 
     # Only scale if model doesn't already include Rescaling(1/255)
     if not model_has_rescaling_layer(model):
@@ -111,72 +107,125 @@ def to_probabilities(pred_vector: np.ndarray) -> np.ndarray:
 
 
 # -----------------------------
-# Load model + class names (hidden)
+# Sidebar settings
+# -----------------------------
+st.sidebar.header("⚙️ Settings")
+
+# Find all .keras models in models/ (repo)
+available_models = []
+if MODELS_DIR.exists():
+    available_models = sorted([p.relative_to(BASE_DIR).as_posix() for p in MODELS_DIR.glob("*.keras")])
+
+# Choose default model
+preferred = "models/image_classification_model_linux.keras"
+default_model_path = preferred if preferred in available_models else (available_models[0] if available_models else preferred)
+
+# Model selector (prevents typos)
+if available_models:
+    model_path_txt = st.sidebar.selectbox(
+        "Model path",
+        options=available_models,
+        index=available_models.index(default_model_path) if default_model_path in available_models else 0,
+    )
+else:
+    model_path_txt = st.sidebar.text_input("Model path", value=default_model_path)
+
+default_classes_path = "class_names.json"
+classes_path_txt = st.sidebar.text_input("Class names file", value=default_classes_path)
+
+model_path = resolve_path(model_path_txt)
+classes_path = resolve_path(classes_path_txt)
+
+st.sidebar.markdown(
+    """
+**Where should my model be?**
+
+- Put your model inside the `models/` folder.
+- Example: `models/image_classification_model_linux.keras`
+    """
+)
+
+# Debug info (helps instantly on Streamlit Cloud)
+st.sidebar.caption(f"Resolved model path: {model_path}")
+st.sidebar.caption(f"Model exists: {model_path.exists()}")
+if MODELS_DIR.exists():
+    st.sidebar.caption(f"Found .keras files: {len(available_models)}")
+
+# -----------------------------
+# Load model + class names
 # -----------------------------
 model = None
 class_names = None
 
-# Friendly checks (no settings UI)
-if not MODEL_PATH.exists():
-    st.error("⚠️ Model file is missing on the server. Please contact the app owner.")
-    st.stop()
+if model_path.exists():
+    try:
+        model = load_model_cached(str(model_path), model_path.stat().st_mtime)
+        st.sidebar.success("Model loaded ✅")
+        st.sidebar.caption(f"Input shape: {getattr(model, 'input_shape', None)}")
+    except Exception as e:
+        st.sidebar.error("Model found, but failed to load ❌")
+        st.sidebar.write(str(e))
+else:
+    st.sidebar.warning("Model file not found ❗")
+    st.sidebar.caption("Select the correct model file from the dropdown above.")
 
-if not CLASSES_PATH.exists():
-    st.error("⚠️ Class labels file is missing on the server. Please contact the app owner.")
-    st.stop()
+if classes_path.exists():
+    try:
+        class_names = load_class_names(str(classes_path))
+        st.sidebar.success(f"Loaded {len(class_names)} class names ✅")
 
-try:
-    model = load_model_cached(str(MODEL_PATH), MODEL_PATH.stat().st_mtime)
-except Exception:
-    st.error("⚠️ The model could not be loaded on the server. Please contact the app owner.")
-    st.stop()
+        # Sanity check
+        try:
+            if model is not None and hasattr(model, "output_shape"):
+                out_dim = model.output_shape[-1]
+                if out_dim is not None and int(out_dim) != len(class_names):
+                    st.sidebar.error(
+                        f"Mismatch: model outputs {int(out_dim)} classes, but class_names.json has {len(class_names)}."
+                    )
+        except Exception:
+            pass
 
-try:
-    class_names = load_class_names(CLASSES_PATH)
-except Exception:
-    st.error("⚠️ The class labels could not be loaded on the server. Please contact the app owner.")
-    st.stop()
+    except Exception as e:
+        st.sidebar.error("class_names.json found, but failed to load ❌")
+        st.sidebar.write(str(e))
+else:
+    st.sidebar.warning("class_names file not found ❗")
+    st.sidebar.caption("Keep class_names.json next to app.py (repo root) or change the path above.")
 
-# Optional sanity check (quiet)
-try:
-    if hasattr(model, "output_shape") and model.output_shape[-1] is not None:
-        out_dim = int(model.output_shape[-1])
-        if out_dim != len(class_names):
-            st.error("⚠️ Internal configuration mismatch (model classes vs class_names). Please contact the app owner.")
-            st.stop()
-except Exception:
-    pass
-
+st.divider()
 
 # -----------------------------
-# Input (camera OR upload)
+# Stop early if not ready
 # -----------------------------
-st.subheader("📷 Take a photo or upload an image")
+if model is None:
+    st.error("Model is not loaded. Please fix the model path in the sidebar.")
+    st.stop()
 
-col1, col2 = st.columns(2)
-with col1:
-    cam = st.camera_input("Take a photo")
-with col2:
-    uploaded = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg"])
+if class_names is None:
+    st.error("class_names.json is not loaded. Please fix the class names file path in the sidebar.")
+    st.stop()
 
-# Reset (optional)
-if st.button("Reset / Clear image"):
-    st.session_state.clear()
+# -----------------------------
+# Upload + Predict
+# -----------------------------
+if st.sidebar.button("Reset / Clear image"):
+    st.session_state["last_hash"] = None
+    st.session_state["last_pred"] = None
+    st.session_state["last_probs"] = None
     st.rerun()
 
-# Choose input priority: camera > upload
-file_obj = cam if cam is not None else uploaded
-if file_obj is None:
-    st.info("Please take a photo or upload an image to get a prediction.")
+uploaded = st.file_uploader("Choose an image", type=["png", "jpg", "jpeg"], key="uploader")
+
+if uploaded is None:
+    st.info("Upload an image to get a prediction.")
     st.stop()
 
-img_bytes = file_obj.getvalue()
+img_bytes = uploaded.getvalue()
 img_hash = hashlib.md5(img_bytes).hexdigest()
 
 img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-st.image(img, caption=f"Uploaded image (id: {img_hash[:8]})", use_container_width=True)
+st.image(img, caption=f"Uploaded image (hash: {img_hash[:8]})", use_container_width=True)
 
-# Preprocess + predict (cache per image)
 x = preprocess(img, model)
 
 if st.session_state.get("last_hash") != img_hash or st.session_state.get("last_probs") is None:
@@ -189,18 +238,19 @@ if st.session_state.get("last_hash") != img_hash or st.session_state.get("last_p
         preds = preds[0]  # (n_classes,)
 
     probs = to_probabilities(preds)
-    pred_id = int(np.argmax(probs))
 
-    # Safe guard
+    pred_id = int(np.argmax(probs))
     if pred_id >= len(class_names):
-        st.error("⚠️ Prediction index is outside the class list. Please contact the app owner.")
+        st.error(
+            f"Prediction index {pred_id} is outside your class_names list (length {len(class_names)}).\n\n"
+            "Fix: make sure `class_names.json` matches the model output order."
+        )
         st.stop()
 
     st.session_state["last_hash"] = img_hash
     st.session_state["last_probs"] = probs
     st.session_state["last_pred"] = pred_id
 
-# Show results
 probs = st.session_state["last_probs"]
 pred_id = int(st.session_state["last_pred"])
 pred_label = class_names[pred_id]
@@ -215,4 +265,4 @@ top_idx = np.argsort(probs)[::-1][:top_k]
 for rank, i in enumerate(top_idx, start=1):
     st.write(f"{rank}. {class_names[int(i)]} — {float(probs[int(i)]):.2%}")
 
-st.caption("If results look wrong, try a brighter/sharper photo and ensure the leaf is clearly visible.")
+st.caption("Tip: If predictions look wrong, double-check your class_names.json order and preprocessing.")
