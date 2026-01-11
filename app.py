@@ -13,7 +13,7 @@ import streamlit as st
 # Page setup (same look, two-panel layout)
 # -----------------------------
 st.set_page_config(
-    page_title="Plant Disease identification through AI",
+    page_title="Plant Disease identification with AI",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -200,8 +200,8 @@ with right:
         """
 <div style="display:flex; align-items:flex-start; gap:0.75rem;">
   <div style="font-size:2.6rem; line-height:1;">🌿</div>
-  <div style="font-size:2.6rem; font-weight:800; line-height:1.08;">
-    Plant Disease identification through AI
+  <div style="font-size:2.6rem; font-weight:700; line-height:1.08;">
+    Plant Disease identification with <br/> AI
   </div>
 </div>
 """,
