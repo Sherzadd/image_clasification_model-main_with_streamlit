@@ -130,13 +130,12 @@ left, right = st.columns([1, 2], gap="large")
 
 
 # -----------------------------
-# LEFT: User Manual
+# LEFT: User Manual (collapsible)
 # -----------------------------
 with left:
-    st.header("📘 User Manual")
-
-    st.markdown(
-        """
+    with st.expander("📘 User Manual", expanded=False):
+        st.markdown(
+            """
 **How to take a good photo (important):**
 - Use **bright natural light** (avoid very dark photos).
 - Keep the leaf **in focus** (**no blur**).
@@ -146,11 +145,11 @@ with left:
 - Don’t crop too tightly — include the **full infected area**.
 
 **How to use the app:**
-1. Click **Browse files** and upload a leaf image (**PNG / JPG / JPEG**).
+1. Click **Take/Upload Photo** and upload a leaf image (**PNG / JPG / JPEG**).
 2. Wait a moment for the prediction.
 3. Read the **predicted class** and **confidence**.
-        """
-    )
+            """
+        )
 
 
 # -----------------------------
@@ -176,7 +175,8 @@ with right:
         st.caption(classes_error)
         st.stop()
 
-    uploaded = st.file_uploader("Choose an image", type=["png", "jpg", "jpeg"], key="uploader")
+    # ✅ Label changed to "Take/Upload Photo" (button inside still shows "Browse files")
+    uploaded = st.file_uploader("Take/Upload Photo", type=["png", "jpg", "jpeg"], key="uploader")
 
     if uploaded is None:
         st.info("Upload an image to get a prediction.")
@@ -188,7 +188,7 @@ with right:
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     st.image(img, caption=f"Uploaded image (hash: {img_hash[:8]})", use_container_width=True)
 
-    # ✅ Reset/Clear image (moved under the image)
+    # Reset/Clear image under the image
     if st.button("Reset / Clear image"):
         st.session_state["last_hash"] = None
         st.session_state["last_pred"] = None
