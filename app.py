@@ -23,9 +23,9 @@ def resolve_path(p: str) -> Path:
 # -----------------------------
 # Page setup
 # -----------------------------
-st.set_page_config(page_title="Plant Disease Classifier", page_icon="🌿", layout="centered")
-st.title("🌿 Plant Disease Classifier")
-st.caption("Upload a leaf image and this app will predict the plant disease class using your trained TensorFlow/Keras model.")
+st.set_page_config(page_title="Plant Disease identification through Artificial Intelligence", page_icon="🌿", layout="centered")
+st.title("🌿 Plant Disease identification through Artificial Intelligence")
+st.caption("Upload a plant leaf image and this app will identify the plant disease using your trained artifitial intelligence (TensorFlow/Keras model).")
 
 # -----------------------------
 # Beginner-friendly explanation
