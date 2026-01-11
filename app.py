@@ -71,7 +71,6 @@ CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
 # -----------------------------
 CONFIDENCE_THRESHOLD = 0.50
 
-# NEW: reject obvious non-leaf / bad quality
 LEAF_RATIO_MIN = 0.05        # how much of the image looks like vegetation-ish colors
 BRIGHTNESS_MIN = 0.12        # too dark -> reject
 BLUR_VAR_MIN = 60.0          # too blurry -> reject (adjust if needed)
@@ -90,7 +89,6 @@ def load_class_names(path: Path) -> list[str]:
 
 @st.cache_resource
 def load_model_cached(model_path: str, mtime: float):
-    # Cache the model so it doesn't reload on every Streamlit rerun
     try:
         return tf.keras.models.load_model(model_path, compile=False)
     except TypeError:
@@ -98,7 +96,6 @@ def load_model_cached(model_path: str, mtime: float):
 
 
 def model_has_rescaling_layer(model: tf.keras.Model) -> bool:
-    """Return True if the model (even nested) contains a Rescaling layer."""
     def _has(layer) -> bool:
         if layer.__class__.__name__.lower() == "rescaling":
             return True
@@ -111,11 +108,6 @@ def model_has_rescaling_layer(model: tf.keras.Model) -> bool:
 
 
 def preprocess(img: Image.Image, model: tf.keras.Model) -> np.ndarray:
-    """
-    Convert PIL image -> NumPy batch (1, H, W, 3)
-    Resize to model input size.
-    Do NOT divide by 255 if model already contains Rescaling(1/255).
-    """
     img = img.convert("RGB")
 
     in_shape = getattr(model, "input_shape", None)  # (None, 256, 256, 3)
@@ -124,8 +116,8 @@ def preprocess(img: Image.Image, model: tf.keras.Model) -> np.ndarray:
         if target_h is not None and target_w is not None:
             img = img.resize((target_w, target_h), Image.BILINEAR)
 
-    x = np.array(img)              # (H, W, 3)
-    x = np.expand_dims(x, 0)       # (1, H, W, 3)
+    x = np.array(img)
+    x = np.expand_dims(x, 0)
     x = x.astype("float32")
 
     if not model_has_rescaling_layer(model):
@@ -135,7 +127,6 @@ def preprocess(img: Image.Image, model: tf.keras.Model) -> np.ndarray:
 
 
 def to_probabilities(pred_vector: np.ndarray) -> np.ndarray:
-    """Ensure the output behaves like probabilities. If not, apply softmax."""
     pred_vector = np.asarray(pred_vector).astype("float32")
     s = float(pred_vector.sum())
     if not (0.98 <= s <= 1.02) or (pred_vector.min() < 0):
@@ -144,16 +135,9 @@ def to_probabilities(pred_vector: np.ndarray) -> np.ndarray:
 
 
 def image_quality_and_leafness(img: Image.Image) -> dict:
-    """
-    Fast heuristics to reject obvious non-leaf images:
-    - brightness (too dark)
-    - blur (Laplacian variance)
-    - leaf_ratio: % pixels in vegetation-ish hue range (HSV)
-    """
     arr = np.asarray(img.convert("RGB")).astype(np.float32)
     brightness = float(arr.mean() / 255.0)
 
-    # Blur score: Laplacian variance (simple 4-neighbor Laplacian)
     gray = arr.mean(axis=2)
     up = np.roll(gray, -1, axis=0)
     down = np.roll(gray, 1, axis=0)
@@ -162,7 +146,6 @@ def image_quality_and_leafness(img: Image.Image) -> dict:
     lap = (up + down + left + right) - 4.0 * gray
     blur_var = float(lap.var())
 
-    # Leaf ratio via HSV (vectorized)
     rgb = arr / 255.0
     r = rgb[..., 0]
     g = rgb[..., 1]
@@ -174,21 +157,19 @@ def image_quality_and_leafness(img: Image.Image) -> dict:
     h = np.zeros_like(maxc)
     mask = delta > 1e-6
 
-    # hue calc
     idx = mask & (maxc == r)
     h[idx] = ((g[idx] - b[idx]) / delta[idx]) % 6.0
     idx = mask & (maxc == g)
     h[idx] = ((b[idx] - r[idx]) / delta[idx]) + 2.0
     idx = mask & (maxc == b)
     h[idx] = ((r[idx] - g[idx]) / delta[idx]) + 4.0
-    h = (h / 6.0) % 1.0  # 0..1
+    h = (h / 6.0) % 1.0
 
     s = np.zeros_like(maxc)
     idx2 = maxc > 1e-6
     s[idx2] = delta[idx2] / maxc[idx2]
     v = maxc
 
-    # vegetation-ish hues: yellow->green (tolerant)
     leaf_mask = (h >= 0.12) & (h <= 0.50) & (s >= 0.15) & (v >= 0.15)
     leaf_ratio = float(leaf_mask.mean())
 
@@ -245,7 +226,7 @@ with left:
 - Don’t crop too tightly — include the **full infected area**.
 
 **How to use the app:**
-1. Click **Take/Upload Photo** and upload a leaf image (**PNG / JPG / JPEG**).
+1. Click **Take/Upload Photo** and take a photo OR upload a leaf image (**PNG / JPG / JPEG**).
 2. Wait a moment for the prediction.
 3. Read the **predicted class** and **confidence**.
             """
@@ -253,13 +234,13 @@ with left:
 
 
 # -----------------------------
-# RIGHT: Title + Upload + Predict
+# RIGHT: Title + Take/Upload + Predict
 # -----------------------------
 with right:
     st.markdown(
         """
 <div style="display:flex; align-items:flex-start; gap:0.75rem;">
-  <div style="font-size:2.6rem; line-height:1;"></div>
+  <div style="font-size:2.6rem; line-height:1;">
   <div style="font-size:2.6rem; font-weight:700; line-height:1.08;">
     Plant Disease identification with AI🌿
   </div>
@@ -285,9 +266,16 @@ with right:
         st.caption(classes_error)
         st.stop()
 
+    # ✅ TAKE PHOTO (camera)
+    cam = st.camera_input("Take Photo")
+
+    # ✅ UPLOAD PHOTO
     uploaded = st.file_uploader("Take/Upload Photo", type=["png", "jpg", "jpeg"], key="uploader")
 
-    if uploaded is None:
+    # Use whichever is provided (camera has priority if both exist)
+    file_obj = cam if cam is not None else uploaded
+
+    if file_obj is None:
         st.info(
             "Upload photos and get the result.\n"
             "For best results, follow the User Manual on the left.\n"
@@ -295,7 +283,7 @@ with right:
         )
         st.stop()
 
-    img_bytes = uploaded.getvalue()
+    img_bytes = file_obj.getvalue()
     img_hash = hashlib.md5(img_bytes).hexdigest()
 
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -308,9 +296,7 @@ with right:
         st.session_state["last_is_confident"] = None
         st.rerun()
 
-    # -----------------------------
-    # NEW: Reject obvious non-leaf / bad quality BEFORE prediction
-    # -----------------------------
+    # Reject obvious non-leaf / bad quality BEFORE prediction
     q = image_quality_and_leafness(img)
 
     if q["brightness"] < BRIGHTNESS_MIN or q["blur_var"] < BLUR_VAR_MIN:
@@ -321,9 +307,7 @@ with right:
         st.warning("⚠️ This does not look like a plant leaf. Please upload a clear leaf photo and try again.")
         st.stop()
 
-    # -----------------------------
     # Predict
-    # -----------------------------
     x = preprocess(img, model)
 
     if st.session_state.get("last_hash") != img_hash or st.session_state.get("last_probs") is None:
@@ -357,8 +341,6 @@ with right:
     pred_id = int(st.session_state["last_pred"])
     confidence = float(probs[pred_id])
 
-    # YOUR RULE:
-    # show prediction only if best >= 50%
     if confidence < CONFIDENCE_THRESHOLD:
         st.warning("⚠️ The image is blur or low quality, please upload another photo and try again.")
         st.stop()
@@ -367,5 +349,12 @@ with right:
 
     st.success(f"✅ Predicted class: **{pred_label}**")
     st.write(f"Confidence: **{confidence:.2%}**")
+
+    st.subheader("3) Top predictions (≥ 50%)")
+    idx_over = np.where(np.asarray(probs) >= CONFIDENCE_THRESHOLD)[0]
+    idx_over = idx_over[np.argsort(np.asarray(probs)[idx_over])[::-1]]
+
+    for rank, i in enumerate(idx_over, start=1):
+        st.write(f"{rank}. {class_names[int(i)]} — {float(probs[int(i)]):.2%}")
 
     st.caption("Tip: If predictions look wrong, try a brighter/sharper photo with a plain background.")
