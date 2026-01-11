@@ -368,11 +368,4 @@ with right:
     st.success(f"✅ Predicted class: **{pred_label}**")
     st.write(f"Confidence: **{confidence:.2%}**")
 
-    st.subheader("3) Top predictions (≥ 50%)")
-    idx_over = np.where(np.asarray(probs) >= CONFIDENCE_THRESHOLD)[0]
-    idx_over = idx_over[np.argsort(np.asarray(probs)[idx_over])[::-1]]
-
-    for rank, i in enumerate(idx_over, start=1):
-        st.write(f"{rank}. {class_names[int(i)]} — {float(probs[int(i)]):.2%}")
-
     st.caption("Tip: If predictions look wrong, try a brighter/sharper photo with a plain background.")
