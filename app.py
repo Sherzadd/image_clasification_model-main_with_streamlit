@@ -1,5 +1,4 @@
 import json
-import os
 import io
 import hashlib
 from pathlib import Path
@@ -18,6 +17,46 @@ st.set_page_config(
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="collapsed",
+)
+
+# -----------------------------
+# ✅ Small UI tweaks (left panel red + title same size + rename uploader button)
+# -----------------------------
+st.markdown(
+    """
+<style>
+/* --- Make the LEFT panel red (the first column of the main horizontal block) --- */
+div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child {
+    background: #b00020;              /* red */
+    padding: 1.25rem 1rem;
+    border-radius: 14px;
+}
+
+/* Make text inside the left panel white for readability */
+div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child,
+div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child * {
+    color: #ffffff !important;
+}
+
+/* Slightly nicer expander header in the left panel */
+div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child summary {
+    background: rgba(255,255,255,0.12);
+    border-radius: 12px;
+    padding: 0.55rem 0.75rem;
+}
+
+/* --- Rename the "Browse files" button text inside the uploader --- */
+div[data-testid="stFileUploader"] button {
+    font-size: 0px !important;        /* hide original "Browse files" */
+}
+div[data-testid="stFileUploader"] button::after {
+    content: "Take/Upload Photo";     /* new label */
+    font-size: 14px;
+    font-weight: 600;
+}
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
 # -----------------------------
@@ -100,15 +139,14 @@ def to_probabilities(pred_vector: np.ndarray) -> np.ndarray:
 model = None
 class_names = None
 
+model_error = None
+classes_error = None
+
 if not MODEL_PATH.exists():
     model_error = "Model file not found ❗"
-else:
-    model_error = None
 
 if not CLASSES_PATH.exists():
     classes_error = "class_names.json file not found ❗"
-else:
-    classes_error = None
 
 if model_error is None:
     try:
@@ -156,7 +194,20 @@ with left:
 # RIGHT: Title + Upload + Predict
 # -----------------------------
 with right:
-    st.title("🌿 Plant Disease identification\nthrough Artificial Intelligence")
+    # Title with BOTH lines the same size (fixes the small circled part)
+    st.markdown(
+        """
+<div style="display:flex; align-items:flex-start; gap:0.75rem;">
+  <div style="font-size:3.0rem; line-height:1;">🌿</div>
+  <div style="font-size:3.0rem; font-weight:800; line-height:1.05;">
+    Plant Disease identification<br/>
+    through Artificial Intelligence
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
     st.caption(
         "Upload a plant leaf image and this app will identify the plant disease using your trained artificial intelligence "
         "(TensorFlow/Keras model)."
@@ -175,7 +226,7 @@ with right:
         st.caption(classes_error)
         st.stop()
 
-    # ✅ Label changed to "Take/Upload Photo" (button inside still shows "Browse files")
+    # Uploader label already "Take/Upload Photo" + button text is also changed by CSS above
     uploaded = st.file_uploader("Take/Upload Photo", type=["png", "jpg", "jpeg"], key="uploader")
 
     if uploaded is None:
