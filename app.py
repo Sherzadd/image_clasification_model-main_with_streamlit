@@ -229,7 +229,9 @@ with right:
     uploaded = st.file_uploader("Take/Upload Photo", type=["png", "jpg", "jpeg"], key="uploader")
 
     if uploaded is None:
-        st.info("Upload image and get the result.")
+        st.info("Upload photos and get the result.\n For best results, follow the User Manual on the left.\n" \
+        "For any issues, please contact the app owner with the following email:\n"
+        "sherzadzabihullah@yahoo.com.")
         st.stop()
 
     img_bytes = uploaded.getvalue()
