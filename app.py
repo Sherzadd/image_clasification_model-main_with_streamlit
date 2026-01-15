@@ -10,7 +10,7 @@ import streamlit as st
 
 
 # -----------------------------
-# Page setup (same look, two-panel layout)
+# Page setup
 # -----------------------------
 st.set_page_config(
     page_title="Plant Disease identification with AI",
@@ -39,9 +39,7 @@ div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child sum
     border-radius: 12px;
     padding: 0.55rem 0.75rem;
 }
-div[data-testid="stFileUploader"] button {
-    font-size: 0px !important;
-}
+div[data-testid="stFileUploader"] button { font-size: 0px !important; }
 div[data-testid="stFileUploader"] button::after {
     content: "Take/Upload Photo";
     font-size: 14px;
@@ -53,7 +51,7 @@ div[data-testid="stFileUploader"] button::after {
 )
 
 # -----------------------------
-# Hidden paths (NO sidebar settings)
+# Paths
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = (BASE_DIR / "models" / "image_classification_model_linux.keras").resolve()
@@ -64,15 +62,21 @@ CLASSES_PATH = (BASE_DIR / "class_names.json").resolve()
 # -----------------------------
 CONFIDENCE_THRESHOLD = 0.50
 
-BRIGHTNESS_MIN = 0.12        # too dark -> reject
-BLUR_VAR_MIN = 60.0          # too blurry -> reject
+BRIGHTNESS_MIN = 0.12
+BLUR_VAR_MIN = 60.0
 
-# Masking thresholds (loose, because we do NOT want to block predictions)
-KEPT_RATIO_MIN = 0.015       # very small is okay; we mainly want a bbox
+# "green seed" must have at least this much area to trust it for bbox
+GREEN_SEED_MIN_RATIO = 0.006  # ~0.6% of pixels
+
+# exclude very dark pixels from being treated as plant (black mulch)
+DARK_V_CUTOFF = 0.10
+
+# bbox padding (increase a bit for multi-leaf / branches)
+BBOX_PAD_FRAC = 0.12
 
 
 # -----------------------------
-# Helpers: loading
+# Loading helpers
 # -----------------------------
 def load_class_names(path: Path) -> list[str]:
     with open(path, "r", encoding="utf-8") as f:
@@ -84,7 +88,6 @@ def load_class_names(path: Path) -> list[str]:
 
 @st.cache_resource
 def load_model_cached(model_path: str, mtime: float):
-    # Some environments support safe_mode, others not
     try:
         return tf.keras.models.load_model(model_path, compile=False, safe_mode=False)
     except TypeError:
@@ -104,24 +107,19 @@ def model_has_rescaling_layer(model: tf.keras.Model) -> bool:
 
 
 # -----------------------------
-# Helpers: preprocessing / postprocessing
+# Pre/post-processing
 # -----------------------------
 def preprocess(img: Image.Image, model: tf.keras.Model) -> np.ndarray:
-    """
-    Convert PIL image -> NumPy batch (1, H, W, 3)
-    Resize to model input size.
-    Do NOT divide by 255 if model already contains Rescaling(1/255).
-    """
     img = img.convert("RGB")
 
-    in_shape = getattr(model, "input_shape", None)  # (None, 256, 256, 3)
+    in_shape = getattr(model, "input_shape", None)
     if isinstance(in_shape, tuple) and len(in_shape) == 4:
         target_h, target_w = in_shape[1], in_shape[2]
         if target_h is not None and target_w is not None:
             img = img.resize((target_w, target_h), Image.BILINEAR)
 
-    x = np.array(img, dtype=np.float32)  # (H,W,3)
-    x = np.expand_dims(x, 0)             # (1,H,W,3)
+    x = np.array(img, dtype=np.float32)
+    x = np.expand_dims(x, 0)
 
     if not model_has_rescaling_layer(model):
         x = x / 255.0
@@ -130,16 +128,14 @@ def preprocess(img: Image.Image, model: tf.keras.Model) -> np.ndarray:
 
 
 def to_probabilities(pred_vector: np.ndarray) -> np.ndarray:
-    """Ensure output behaves like probabilities. If not, apply softmax."""
     pred_vector = np.asarray(pred_vector, dtype=np.float32)
     s = float(pred_vector.sum())
-    if not (0.98 <= s <= 1.02) or (pred_vector.min() < 0.0) or (pred_vector.max() > 1.0):
+    if not (0.98 <= s <= 1.02) or pred_vector.min() < 0.0 or pred_vector.max() > 1.0:
         pred_vector = tf.nn.softmax(pred_vector).numpy()
     return pred_vector
 
 
 def image_quality(img: Image.Image) -> dict:
-    """Brightness + blur (Laplacian variance)."""
     arr = np.asarray(img.convert("RGB"), dtype=np.float32)
     brightness = float(arr.mean() / 255.0)
 
@@ -157,36 +153,49 @@ def image_quality(img: Image.Image) -> dict:
 # -----------------------------
 # Mask utilities (no OpenCV)
 # -----------------------------
-def _fill_holes(mask: np.ndarray, max_iters: int = 2000) -> np.ndarray:
-    """
-    Fill holes inside a binary mask using flood-fill from image borders
-    on the inverse mask.
-    """
+def rgb_to_hsv(rgb01: np.ndarray):
+    """rgb01: float array in [0,1], shape (H,W,3) -> h,s,v in [0,1]"""
+    r = rgb01[..., 0]
+    g = rgb01[..., 1]
+    b = rgb01[..., 2]
+
+    maxc = np.maximum(np.maximum(r, g), b)
+    minc = np.minimum(np.minimum(r, g), b)
+    delta = maxc - minc
+
+    h = np.zeros_like(maxc)
+    m = delta > 1e-6
+
+    idx = m & (maxc == r)
+    h[idx] = ((g[idx] - b[idx]) / delta[idx]) % 6.0
+    idx = m & (maxc == g)
+    h[idx] = ((b[idx] - r[idx]) / delta[idx]) + 2.0
+    idx = m & (maxc == b)
+    h[idx] = ((r[idx] - g[idx]) / delta[idx]) + 4.0
+    h = (h / 6.0) % 1.0
+
+    s = np.zeros_like(maxc)
+    idx2 = maxc > 1e-6
+    s[idx2] = delta[idx2] / maxc[idx2]
+
+    v = maxc
+    return h, s, v
+
+
+def dilate(mask: np.ndarray, iters: int = 2) -> np.ndarray:
+    """Simple dilation using 4-neighborhood via rolls."""
     mask = mask.astype(bool)
-    inv = ~mask
-
-    reach = np.zeros_like(inv, dtype=bool)
-    reach[0, :] = inv[0, :]
-    reach[-1, :] = inv[-1, :]
-    reach[:, 0] = inv[:, 0]
-    reach[:, -1] = inv[:, -1]
-
-    for _ in range(max_iters):
+    for _ in range(iters):
         nb = (
-            np.roll(reach, 1, 0) | np.roll(reach, -1, 0) |
-            np.roll(reach, 1, 1) | np.roll(reach, -1, 1)
+            mask
+            | np.roll(mask, 1, 0) | np.roll(mask, -1, 0)
+            | np.roll(mask, 1, 1) | np.roll(mask, -1, 1)
         )
-        new = reach | (nb & inv)
-        if new.sum() == reach.sum():
-            reach = new
-            break
-        reach = new
-
-    holes = inv & ~reach
-    return mask | holes
+        mask = nb
+    return mask
 
 
-def _bbox_from_mask(mask: np.ndarray):
+def bbox_from_mask(mask: np.ndarray):
     ys, xs = np.where(mask)
     if len(xs) == 0 or len(ys) == 0:
         return None
@@ -195,7 +204,7 @@ def _bbox_from_mask(mask: np.ndarray):
     return x0, y0, x1, y1
 
 
-def _pad_bbox(bbox, W, H, pad_frac: float = 0.06):
+def pad_bbox(bbox, W, H, pad_frac: float = 0.12):
     x0, y0, x1, y1 = bbox
     bw = max(1, x1 - x0 + 1)
     bh = max(1, y1 - y0 + 1)
@@ -208,20 +217,39 @@ def _pad_bbox(bbox, W, H, pad_frac: float = 0.06):
     return x0, y0, x1, y1
 
 
-def _apply_white_bg(img: Image.Image, mask: np.ndarray) -> Image.Image:
-    """Preview-only: show masked image with white background."""
-    mask_img = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
-    white = Image.new("RGB", img.size, (255, 255, 255))
-    return Image.composite(img, white, mask_img)
-
-
 # -----------------------------
-# Mask methods
+# Plant "seed" mask (vegetation-first)
 # -----------------------------
-def mask_by_corners(img: Image.Image, patch: int = 24, percentile: float = 99.5, extra_margin: float = 0.05):
+def green_seed_mask(img: Image.Image):
     """
-    Estimate background color from 4 corners, keep pixels far from it.
-    Good when corners are true background.
+    Create a vegetation-ish seed mask (good for multi-leaf / branch scenes).
+    IMPORTANT: This is only used to compute bbox. Prediction uses ORIGINAL crop.
+    """
+    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+    h, s, v = rgb_to_hsv(arr)
+
+    # vegetation hues (yellow->green), relaxed
+    hsv_leaf = (h >= 0.08) & (h <= 0.60) & (s >= 0.10) & (v >= 0.12)
+
+    # green dominance (helps when hue is noisy)
+    r = arr[..., 0]; g = arr[..., 1]; b = arr[..., 2]
+    green_dom = (g > r * 1.03) & (g > b * 1.03) & (v >= 0.10)
+
+    seed = hsv_leaf | green_dom
+
+    # remove very dark pixels so black mulch is not selected
+    seed = seed & (v >= DARK_V_CUTOFF)
+
+    return seed, float(seed.mean())
+
+
+# -----------------------------
+# Corner-based fallback (but with dark-exclusion)
+# -----------------------------
+def mask_by_corners_bbox(img: Image.Image, patch: int = 24, percentile: float = 99.5, extra_margin: float = 0.05):
+    """
+    BBox-only fallback using corner background distance.
+    We still exclude very dark pixels to avoid black mulch.
     """
     img = img.convert("RGB")
     arr = np.asarray(img, dtype=np.float32) / 255.0
@@ -246,110 +274,60 @@ def mask_by_corners(img: Image.Image, patch: int = 24, percentile: float = 99.5,
 
     raw = dist > thr
 
+    # clean
     m = Image.fromarray((raw.astype(np.uint8) * 255), mode="L")
     m = m.filter(ImageFilter.MedianFilter(size=5))
     m = m.filter(ImageFilter.GaussianBlur(radius=1.0))
     mask = (np.array(m) > 40)
 
-    mask = _fill_holes(mask)
-    kept_ratio = float(mask.mean())
+    # exclude very dark pixels (prevents black plastic mulch being foreground)
+    _, _, v = rgb_to_hsv(arr)
+    mask = mask & (v >= DARK_V_CUTOFF)
 
-    return {"mask": mask, "kept_ratio": kept_ratio, "method": "corners"}
-
-
-def mask_by_hsv(img: Image.Image):
-    """
-    Fallback: vegetation-like colors + green-dominance.
-    IMPORTANT: this is only used to get a bbox; prediction uses original crop.
-    """
-    img = img.convert("RGB")
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
-
-    maxc = np.maximum(np.maximum(r, g), b)
-    minc = np.minimum(np.minimum(r, g), b)
-    delta = maxc - minc
-
-    h = np.zeros_like(maxc)
-    m = delta > 1e-6
-
-    idx = m & (maxc == r)
-    h[idx] = ((g[idx] - b[idx]) / delta[idx]) % 6.0
-    idx = m & (maxc == g)
-    h[idx] = ((b[idx] - r[idx]) / delta[idx]) + 2.0
-    idx = m & (maxc == b)
-    h[idx] = ((r[idx] - g[idx]) / delta[idx]) + 4.0
-    h = (h / 6.0) % 1.0
-
-    s = np.zeros_like(maxc)
-    idx2 = maxc > 1e-6
-    s[idx2] = delta[idx2] / maxc[idx2]
-    v = maxc
-
-    # relaxed vegetation-ish thresholds
-    hsv_leaf = (h >= 0.08) & (h <= 0.58) & (s >= 0.10) & (v >= 0.10)
-
-    # also accept "green dominance" pixels
-    green_dom = (g > r * 1.02) & (g > b * 1.02) & (v >= 0.08)
-
-    raw = hsv_leaf | green_dom
-
-    m_img = Image.fromarray((raw.astype(np.uint8) * 255), mode="L")
-    m_img = m_img.filter(ImageFilter.MedianFilter(size=5))
-    m_img = m_img.filter(ImageFilter.GaussianBlur(radius=1.0))
-    mask = (np.array(m_img) > 40)
-
-    mask = _fill_holes(mask)
-    kept_ratio = float(mask.mean())
-
-    return {"mask": mask, "kept_ratio": kept_ratio, "method": "hsv"}
-
-
-def mask_leaf_for_prediction(img: Image.Image):
-    """
-    Returns:
-      pred_img  -> ORIGINAL crop (keeps symptoms!)
-      preview_img -> masked preview (optional UI)
-      info
-    """
-    W, H = img.size
-
-    # 1) corners
-    out = mask_by_corners(img)
-    if out is not None and out["kept_ratio"] >= KEPT_RATIO_MIN:
-        bbox = _bbox_from_mask(out["mask"])
-        if bbox is not None:
-            bbox = _pad_bbox(bbox, W, H)
-            x0, y0, x1, y1 = bbox
-            pred_img = img.crop((x0, y0, x1 + 1, y1 + 1))  # ORIGINAL crop ✅
-            preview = _apply_white_bg(img, out["mask"]).crop((x0, y0, x1 + 1, y1 + 1))
-            out["bbox"] = bbox
-            return pred_img, preview, out
-
-    # 2) hsv fallback
-    out2 = mask_by_hsv(img)
-    if out2 is not None and out2["kept_ratio"] >= KEPT_RATIO_MIN:
-        bbox = _bbox_from_mask(out2["mask"])
-        if bbox is not None:
-            bbox = _pad_bbox(bbox, W, H)
-            x0, y0, x1, y1 = bbox
-            pred_img = img.crop((x0, y0, x1 + 1, y1 + 1))  # ORIGINAL crop ✅
-            preview = _apply_white_bg(img, out2["mask"]).crop((x0, y0, x1 + 1, y1 + 1))
-            out2["bbox"] = bbox
-            return pred_img, preview, out2
-
-    # 3) final fallback: no masking, no block
-    return img, img, {"kept_ratio": 1.0, "method": "none", "bbox": None}
+    bbox = bbox_from_mask(mask)
+    return bbox
 
 
 # -----------------------------
-# Load model + class names (hidden)
+# Main: crop selection (NO symptom loss)
+# -----------------------------
+def get_prediction_crop(img: Image.Image):
+    """
+    Returns:
+      pred_img: ORIGINAL cropped image (used for prediction)
+      info: dict with method + bbox
+    """
+    W, H = img.size
+
+    # 1) vegetation-first bbox (best for multiple leaves/branches)
+    seed, ratio = green_seed_mask(img)
+    if ratio >= GREEN_SEED_MIN_RATIO:
+        seed2 = dilate(seed, iters=3)  # include near-branch pixels
+        bbox = bbox_from_mask(seed2)
+        if bbox is not None:
+            bbox = pad_bbox(bbox, W, H, pad_frac=BBOX_PAD_FRAC)
+            x0, y0, x1, y1 = bbox
+            return img.crop((x0, y0, x1 + 1, y1 + 1)), {"method": "green_seed", "bbox": bbox, "ratio": ratio}
+
+    # 2) corner-based fallback bbox (but avoid dark pixels)
+    bbox = mask_by_corners_bbox(img)
+    if bbox is not None:
+        bbox = pad_bbox(bbox, W, H, pad_frac=BBOX_PAD_FRAC)
+        x0, y0, x1, y1 = bbox
+        return img.crop((x0, y0, x1 + 1, y1 + 1)), {"method": "corners_bbox", "bbox": bbox, "ratio": ratio}
+
+    # 3) final fallback: use full image
+    return img, {"method": "none", "bbox": None, "ratio": ratio}
+
+
+# -----------------------------
+# Load model + class names
 # -----------------------------
 model_error = None
 classes_error = None
 
 if not MODEL_PATH.exists():
-    model_error = "Model file not found ❗"
+    model_error = "Model file not found ❗ (Expected inside /models)"
 
 if not CLASSES_PATH.exists():
     classes_error = "class_names.json file not found ❗"
@@ -371,7 +349,7 @@ if classes_error is None:
 
 
 # -----------------------------
-# Layout: LEFT / RIGHT
+# Layout
 # -----------------------------
 left, right = st.columns([1, 3], gap="large")
 
@@ -379,15 +357,13 @@ with left:
     with st.expander("📘 User Manual", expanded=False):
         st.markdown(
             """
-**How to take a good photo (important):**
-- Use **bright natural light** (avoid very dark photos).
-- Keep the leaf **in focus** (**no blur**).
-- Capture **one leaf clearly** (fill most of the frame).
-- A plain background helps, but **is NOT required**.
+**Tips for best results:**
+- Bright natural light (avoid very dark photos)
+- Keep leaf/plant in focus (no blur)
+- Multiple leaves/branches are OK
+- Plain background helps, but is NOT required
 
-**How the app works now:**
-- The app tries to **find the leaf area** and crops the image.
-- The model predicts on the **original cropped leaf** (symptoms are preserved).
+**Important:** The app crops the plant area but predicts on the **original crop**, so symptoms are not removed.
             """
         )
 
@@ -404,8 +380,7 @@ with right:
     )
 
     st.caption(
-        "Upload a plant leaf image and this app will identify the plant disease using our trained artificial intelligence model "
-        "(TensorFlow/Keras)."
+        "Upload a plant image and this app will identify the plant disease using our trained AI model (TensorFlow/Keras)."
     )
 
     st.divider()
@@ -442,17 +417,15 @@ with right:
         st.rerun()
 
     # -----------------------------
-    # NEW behavior: find bbox, then predict on ORIGINAL cropped leaf
+    # NEW: crop plant area (prediction uses ORIGINAL crop)
     # -----------------------------
-    pred_img, preview_img, mask_info = mask_leaf_for_prediction(img)
+    pred_img, crop_info = get_prediction_crop(img)
 
-    with st.expander("🧪 Show leaf crop / masking preview (used to locate the leaf)", expanded=False):
-        st.image(preview_img, use_container_width=True)
-        st.caption(f"Method: {mask_info['method']} | Kept ratio: {mask_info['kept_ratio']:.2%}")
-        if mask_info["method"] == "none":
-            st.info("Masking wasn’t reliable here — using the original image for prediction (no crop).")
+    with st.expander("🧪 Show crop used for prediction", expanded=False):
+        st.image(pred_img, use_container_width=True)
+        st.caption(f"Crop method: {crop_info['method']} | green_seed_ratio: {crop_info.get('ratio', 0.0):.2%}")
 
-    # Quality checks on the image we actually feed to the model
+    # quality checks on pred_img
     q = image_quality(pred_img)
     if q["brightness"] < BRIGHTNESS_MIN or q["blur_var"] < BLUR_VAR_MIN:
         st.warning("⚠️ The image is blur or low quality, please upload another photo and try again.")
@@ -468,6 +441,7 @@ with right:
 
         if isinstance(preds, (list, tuple)):
             preds = preds[0]
+
         preds = np.asarray(preds)
         if preds.ndim == 2:
             preds = preds[0]
@@ -491,7 +465,7 @@ with right:
     confidence = float(probs[pred_id])
 
     if confidence < CONFIDENCE_THRESHOLD:
-        st.warning("⚠️ The image is blur or low quality, please upload another photo and try again.")
+        st.warning("⚠️ Low confidence. Try a clearer/brighter photo or move closer to the leaf.")
         st.stop()
 
     pred_label = class_names[pred_id]
@@ -506,4 +480,4 @@ with right:
     for rank, i in enumerate(idx_over, start=1):
         st.write(f"{rank}. {class_names[int(i)]} — {float(probs[int(i)]):.2%}")
 
-    st.caption("Tip: If predictions look wrong, try a brighter/sharper photo.")
+    st.caption("Tip: If predictions look wrong, try a brighter/sharper photo and move closer to the leaf.")
