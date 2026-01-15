@@ -76,8 +76,8 @@ LEAF_RATIO_MIN = 0.05        # how much of the image looks like vegetation-ish c
 BRIGHTNESS_MIN = 0.12        # too dark -> reject
 BLUR_VAR_MIN = 60.0          # too blurry -> reject (adjust if needed)
 
-# NEW: background masking sanity check
-KEPT_RATIO_MIN = 0.05        # if we keep too little, masking failed
+# NEW: background masking sanity check (less strict than before)
+KEPT_RATIO_MIN = 0.02        # was 0.05
 
 
 # -----------------------------
@@ -95,9 +95,9 @@ def load_class_names(path: Path) -> list[str]:
 def load_model_cached(model_path: str, mtime: float):
     # Cache the model so it doesn't reload on every Streamlit rerun
     try:
-        return tf.keras.models.load_model(model_path, compile=False)
-    except TypeError:
         return tf.keras.models.load_model(model_path, compile=False, safe_mode=False)
+    except TypeError:
+        return tf.keras.models.load_model(model_path, compile=False)
 
 
 def model_has_rescaling_layer(model: tf.keras.Model) -> bool:
@@ -141,7 +141,7 @@ def to_probabilities(pred_vector: np.ndarray) -> np.ndarray:
     """Ensure the output behaves like probabilities. If not, apply softmax."""
     pred_vector = np.asarray(pred_vector).astype("float32")
     s = float(pred_vector.sum())
-    if not (0.98 <= s <= 1.02) or (pred_vector.min() < 0):
+    if not (0.98 <= s <= 1.02) or (pred_vector.min() < 0) or (pred_vector.max() > 1.0):
         pred_vector = tf.nn.softmax(pred_vector).numpy()
     return pred_vector
 
@@ -177,7 +177,6 @@ def image_quality_and_leafness(img: Image.Image) -> dict:
     h = np.zeros_like(maxc)
     mask = delta > 1e-6
 
-    # hue calc
     idx = mask & (maxc == r)
     h[idx] = ((g[idx] - b[idx]) / delta[idx]) % 6.0
     idx = mask & (maxc == g)
@@ -198,9 +197,6 @@ def image_quality_and_leafness(img: Image.Image) -> dict:
     return {"brightness": brightness, "blur_var": blur_var, "leaf_ratio": leaf_ratio}
 
 
-# -----------------------------
-# NEW: Background masking (corner-based, robust)
-# -----------------------------
 def mask_background_by_corners(
     img: Image.Image,
     patch: int = 24,
@@ -208,7 +204,7 @@ def mask_background_by_corners(
     extra_margin: float = 0.05,
 ):
     """
-    Mask background using 4 corner patches (works even if the leaf is brown/dry).
+    Mask background using 4 corner patches (works if corners are real background).
     Returns: masked_img, masked_cropped_img, info_dict
     """
     img = img.convert("RGB")
@@ -234,7 +230,6 @@ def mask_background_by_corners(
 
     mask = dist > thr
 
-    # Clean mask (simple, no extra dependencies)
     m = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
     m = m.filter(ImageFilter.MedianFilter(size=5))
     m = m.filter(ImageFilter.GaussianBlur(radius=1.0))
@@ -242,12 +237,10 @@ def mask_background_by_corners(
 
     kept_ratio = float(mask_c.mean())
 
-    # Apply mask (white background)
     mask_img = Image.fromarray((mask_c.astype(np.uint8) * 255), mode="L")
     white = Image.new("RGB", img.size, (255, 255, 255))
     masked = Image.composite(img, white, mask_img)
 
-    # Crop to bbox
     ys, xs = np.where(mask_c)
     masked_cropped = masked
     if len(xs) and len(ys):
@@ -260,7 +253,86 @@ def mask_background_by_corners(
         y1 = min(H - 1, y1 + pad)
         masked_cropped = masked.crop((x0, y0, x1 + 1, y1 + 1))
 
-    return masked, masked_cropped, {"kept_ratio": kept_ratio, "threshold": thr}
+    return masked, masked_cropped, {"kept_ratio": kept_ratio, "method": "corners"}
+
+
+def mask_background_hsv_leaf(img: Image.Image):
+    """
+    Fallback for non-plain backgrounds when the leaf is green-ish.
+    Returns: masked_img, masked_cropped_img, info_dict
+    """
+    img = img.convert("RGB")
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+
+    # RGB -> HSV (vectorized)
+    maxc = np.maximum(np.maximum(r, g), b)
+    minc = np.minimum(np.minimum(r, g), b)
+    delta = maxc - minc
+
+    h = np.zeros_like(maxc)
+    m = delta > 1e-6
+
+    idx = m & (maxc == r)
+    h[idx] = ((g[idx] - b[idx]) / delta[idx]) % 6.0
+    idx = m & (maxc == g)
+    h[idx] = ((b[idx] - r[idx]) / delta[idx]) + 2.0
+    idx = m & (maxc == b)
+    h[idx] = ((r[idx] - g[idx]) / delta[idx]) + 4.0
+    h = (h / 6.0) % 1.0
+
+    s = np.zeros_like(maxc)
+    idx2 = maxc > 1e-6
+    s[idx2] = delta[idx2] / maxc[idx2]
+    v = maxc
+
+    # relaxed vegetation-ish thresholds
+    hsv_leaf = (h >= 0.08) & (h <= 0.55) & (s >= 0.12) & (v >= 0.12)
+    green_dom = (g > r * 1.03) & (g > b * 1.03) & (v >= 0.10)
+
+    mask = hsv_leaf | green_dom
+
+    m_img = Image.fromarray((mask.astype(np.uint8) * 255), mode="L")
+    m_img = m_img.filter(ImageFilter.MedianFilter(size=5))
+    m_img = m_img.filter(ImageFilter.GaussianBlur(radius=1.0))
+    mask_c = (np.array(m_img) > 40)
+
+    kept_ratio = float(mask_c.mean())
+
+    mask_img = Image.fromarray((mask_c.astype(np.uint8) * 255), mode="L")
+    white = Image.new("RGB", img.size, (255, 255, 255))
+    masked = Image.composite(img, white, mask_img)
+
+    ys, xs = np.where(mask_c)
+    masked_cropped = masked
+    if len(xs) and len(ys):
+        x0, x1 = xs.min(), xs.max()
+        y0, y1 = ys.min(), ys.max()
+        pad = int(0.06 * max((x1 - x0 + 1), (y1 - y0 + 1)))
+        x0 = max(0, x0 - pad)
+        y0 = max(0, y0 - pad)
+        x1 = min(img.size[0] - 1, x1 + pad)
+        y1 = min(img.size[1] - 1, y1 + pad)
+        masked_cropped = masked.crop((x0, y0, x1 + 1, y1 + 1))
+
+    return masked, masked_cropped, {"kept_ratio": kept_ratio, "method": "hsv"}
+
+
+def mask_leaf_for_prediction(img: Image.Image):
+    """
+    1) Try corner-based masking
+    2) If fails, try HSV masking
+    3) If fails, use original image (DO NOT BLOCK)
+    """
+    masked1, cropped1, info1 = mask_background_by_corners(img)
+    if info1["kept_ratio"] >= KEPT_RATIO_MIN:
+        return masked1, cropped1, info1
+
+    masked2, cropped2, info2 = mask_background_hsv_leaf(img)
+    if info2["kept_ratio"] >= KEPT_RATIO_MIN:
+        return masked2, cropped2, info2
+
+    return img, img, {"kept_ratio": max(info1["kept_ratio"], info2["kept_ratio"]), "method": "none"}
 
 
 # -----------------------------
@@ -310,12 +382,12 @@ with left:
 - Capture **one leaf clearly** (fill most of the frame).
 - Use a **plain background** if possible.
 - Avoid strong **shadows**, **reflections**, and **filters**.
-- Don't crop too tightly — include the **full infected area**.
+- Don’t crop too tightly — include the **full infected area**.
 
 **How to use the app:**
 1. Click **Take/Upload Photo** and upload a leaf image (**PNG / JPG / JPEG**).
-2. The app will **mask the background automatically** (focus only on the leaf).
-3. Read the **predicted class** and **confidence**.
+2. The app will **try to mask the background** (best effort).
+3. If masking isn’t reliable, it will still predict using the original image.
             """
         )
 
@@ -377,20 +449,19 @@ with right:
         st.rerun()
 
     # -----------------------------
-    # NEW: Mask background (model uses masked_cropped)
+    # Mask background (best effort) -> model uses masked_cropped
     # -----------------------------
-    masked, masked_cropped, mask_info = mask_background_by_corners(img)
+    masked, masked_cropped, mask_info = mask_leaf_for_prediction(img)
 
     with st.expander("🧪 Show background-masked image (used for prediction)", expanded=False):
         st.image(masked_cropped, use_container_width=True)
-        st.caption(f"Kept ratio: {mask_info['kept_ratio']:.2%}")
+        st.caption(f"Mask method: {mask_info['method']} | Kept ratio: {mask_info['kept_ratio']:.2%}")
 
-    if mask_info["kept_ratio"] < KEPT_RATIO_MIN:
-        st.warning("⚠️ Could not isolate the leaf well. Please use a plain background and try again.")
-        st.stop()
+    if mask_info["method"] == "none":
+        st.info("Masking was not reliable for this photo — using the original image for prediction.")
 
     # -----------------------------
-    # Run your checks on the masked image
+    # Run your checks on the image we will predict with
     # -----------------------------
     q = image_quality_and_leafness(masked_cropped)
 
@@ -399,8 +470,8 @@ with right:
         st.stop()
 
     # Leafness HSV-green check can fail for very brown leaves,
-    # so allow fallback when the mask kept a reasonable object size.
-    if q["leaf_ratio"] < LEAF_RATIO_MIN and mask_info["kept_ratio"] < 0.10:
+    # so only block if BOTH leaf_ratio is very low AND we couldn't mask anything useful.
+    if q["leaf_ratio"] < LEAF_RATIO_MIN and mask_info["method"] == "none":
         st.warning("⚠️ This does not look like a plant leaf. Please upload a clear leaf photo and try again.")
         st.stop()
 
