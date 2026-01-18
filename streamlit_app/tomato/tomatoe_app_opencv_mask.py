@@ -274,13 +274,92 @@ def _auto_leaf_mask(np_rgb: np.ndarray) -> tuple[np.ndarray, str]:
     return best_mask, best_name
 
 
-def _bbox_from_mask_255(mask_255: np.ndarray):
+def _bbox_from_mask_255(mask_255: np.ndarray, np_rgb: np.ndarray | None = None):
+    """
+    Choose a *best* component bbox, not simply the largest.
+
+    Why: In real photos, the largest green region can be background leaves or even fruit.
+    We score candidates using:
+      - closeness to image center (users usually center the target leaf)
+      - focus/sharpness (foreground leaf tends to be sharper than background)
+      - leaf-like shape (less circular than fruit)
+      - reasonable area
+    """
     cnts, _ = cv2.findContours(mask_255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
-    c = max(cnts, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(c)
-    return x, y, x + w - 1, y + h - 1
+
+    h, w = mask_255.shape[:2]
+    img_area = float(h * w)
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+
+    # Precompute focus map if image is provided
+    gray = None
+    if np_rgb is not None and np_rgb.ndim == 3:
+        try:
+            gray = cv2.cvtColor(np_rgb, cv2.COLOR_RGB2GRAY)
+        except Exception:
+            gray = None
+
+    best_bbox = None
+    best_score = -1e9
+
+    for c in cnts:
+        area = float(cv2.contourArea(c))
+        if area <= 0:
+            continue
+
+        # Ignore extremely tiny components
+        if (area / img_area) < 0.005:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(c)
+        x1 = x + bw - 1
+        y1 = y + bh - 1
+
+        # Distance to image center (normalized)
+        bx, by = x + bw / 2.0, y + bh / 2.0
+        dist = float(np.hypot((bx - cx) / w, (by - cy) / h))
+
+        # Shape: circularity (fruit ~1, leaves usually lower)
+        perim = float(cv2.arcLength(c, True))
+        circularity = (4.0 * np.pi * area) / (perim * perim + 1e-6)
+        circularity = float(np.clip(circularity, 0.0, 1.2))
+
+        # Focus (foreground tends to be sharper); normalize to ~[0,1.5]
+        focus_norm = 0.0
+        if gray is not None:
+            roi = gray[max(0, y):min(h, y1 + 1), max(0, x):min(w, x1 + 1)]
+            if roi.size >= 400:  # avoid unstable tiny ROIs
+                fv = float(cv2.Laplacian(roi, cv2.CV_64F).var())
+                focus_norm = float(np.clip(fv / 120.0, 0.0, 1.5))
+
+        # Border penalty (background regions often touch borders)
+        touches_border = (x <= 1) or (y <= 1) or (x1 >= w - 2) or (y1 >= h - 2)
+        border_penalty = 0.35 if touches_border else 0.0
+
+        area_ratio = area / img_area
+
+        # Candidate score (tuned for "choose the centered, sharp leaf")
+        score = (
+            0.80 * area_ratio
+            - 1.60 * dist
+            + 0.70 * focus_norm
+            + 0.35 * (1.0 - min(circularity, 1.0))
+            - border_penalty
+        )
+
+        if score > best_score:
+            best_score = score
+            best_bbox = (int(x), int(y), int(x1), int(y1))
+
+    # Fallback: if scoring filtered everything, use largest area
+    if best_bbox is None:
+        c = max(cnts, key=cv2.contourArea)
+        x, y, bw, bh = cv2.boundingRect(c)
+        best_bbox = (int(x), int(y), int(x + bw - 1), int(y + bh - 1))
+
+    return best_bbox
 
 
 def _pad_bbox(bbox, W, H, pad_frac: float = 0.06):
@@ -296,17 +375,25 @@ def _pad_bbox(bbox, W, H, pad_frac: float = 0.06):
     return x0, y0, x1, y1
 
 
-def _overlay_mask_on_crop(crop_img: Image.Image, mask_crop_255: np.ndarray, alpha: float = 0.35) -> Image.Image:
-    """Preview-only: overlay mask on ORIGINAL crop (symptoms stay visible)."""
+def _overlay_mask_on_crop(crop_img: Image.Image, mask_crop_255: np.ndarray) -> Image.Image:
+    """
+    Preview-only: draw mask OUTLINE on the ORIGINAL crop.
+
+    Important: Do NOT fill/tint the whole leaf region, otherwise disease spots can look
+    "greener" or visually muted. Outlines preserve the original colors and symptoms.
+    """
     arr = np.asarray(crop_img.convert("RGB"), dtype=np.uint8)
-    m = (mask_crop_255 > 0)
-    if not bool(np.any(m)):
+    if mask_crop_255 is None or not bool(np.any(mask_crop_255 > 0)):
         return crop_img
 
-    overlay = arr.copy()
-    color = np.array([0, 255, 0], dtype=np.uint8)
-    overlay[m] = (overlay[m] * (1 - alpha) + color * alpha).astype(np.uint8)
-    return Image.fromarray(overlay)
+    cnts, _ = cv2.findContours(mask_crop_255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return crop_img
+
+    out = arr.copy()
+    # Drawing on RGB works fine because (0,255,0) is green in both RGB and BGR.
+    cv2.drawContours(out, cnts, -1, (0, 255, 0), thickness=3)
+    return Image.fromarray(out)
 
 
 def mask_leaf_for_prediction(img: Image.Image):
@@ -325,7 +412,8 @@ def mask_leaf_for_prediction(img: Image.Image):
     kept_ratio = float((mask_255 > 0).mean())
 
     if kept_ratio >= KEPT_RATIO_MIN:
-        bbox = _bbox_from_mask_255(mask_255)
+        # Use the image itself to help select the most relevant component (sharp + centered)
+        bbox = _bbox_from_mask_255(mask_255, np_rgb=np_rgb)
         if bbox is not None:
             bbox = _pad_bbox(bbox, W, H)
             x0, y0, x1, y1 = bbox
