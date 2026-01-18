@@ -56,8 +56,10 @@ div[data-testid="stFileUploader"] button::after {
 # Hidden paths (NO sidebar settings)
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = (BASE_DIR / "streamlit_app" / "tomato" / "01_tomato_disease_linux.keras").resolve()
-CLASSES_PATH = (BASE_DIR / "streamlit_app" / "tomato_classs_names.json").resolve()
+
+MODEL_PATH = (BASE_DIR / "01_tomato_disease_model_linux.keras").resolve()
+CLASSES_PATH = (BASE_DIR / "tomato_class_names.json").resolve()
+
 
 # -----------------------------
 # Rules / thresholds
