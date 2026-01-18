@@ -56,10 +56,8 @@ div[data-testid="stFileUploader"] button::after {
 # Hidden paths (NO sidebar settings)
 # -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
-
-MODEL_PATH = (BASE_DIR / "01_tomato_disease_model_linux.keras").resolve()
-CLASSES_PATH = (BASE_DIR / "tomato_class_names.json").resolve()
-
+MODEL_PATH = (BASE_DIR / "streamlit_app" / "tomato" / "01_tomato_disease_linux.keras").resolve()
+CLASSES_PATH = (BASE_DIR / "streamlit_app" / "tomato_classs_names.json").resolve()
 
 # -----------------------------
 # Rules / thresholds
@@ -217,6 +215,41 @@ def _apply_white_bg(img: Image.Image, mask: np.ndarray) -> Image.Image:
     return Image.composite(img, white, mask_img)
 
 
+def _score_mask_candidate(out: dict, W: int, H: int):
+    """Score a mask candidate for AUTO selection.
+
+    Returns:
+        (score, bbox, bbox_area_ratio) or (None, None, None) if invalid.
+
+    We prefer masks that produce a meaningful bbox (leaf occupies real area)
+    and avoid tiny / patchy masks.
+    """
+    if out is None or "mask" not in out:
+        return None, None, None
+
+    bbox = _bbox_from_mask(out["mask"])
+    if bbox is None:
+        return None, None, None
+
+    bbox = _pad_bbox(bbox, W, H)
+    x0, y0, x1, y1 = bbox
+    bbox_area = (x1 - x0 + 1) * (y1 - y0 + 1)
+    bbox_area_ratio = float(bbox_area / (W * H))
+
+    kept_ratio = float(out.get("kept_ratio", 0.0))
+
+    # Weighted score: bbox coverage matters more than raw kept_ratio
+    score = (0.70 * min(bbox_area_ratio, 1.0)) + (0.30 * min(kept_ratio, 0.60))
+
+    # Penalize clearly bad bboxes
+    if bbox_area_ratio < 0.05:
+        score *= 0.20
+    elif bbox_area_ratio > 0.98:
+        score *= 0.50
+
+    return score, bbox, bbox_area_ratio
+
+
 # -----------------------------
 # Mask methods
 # -----------------------------
@@ -316,32 +349,40 @@ def mask_leaf_for_prediction(img: Image.Image):
     """
     W, H = img.size
 
-    # 1) corners
-    out = mask_by_corners(img)
-    if out is not None and out["kept_ratio"] >= KEPT_RATIO_MIN:
-        bbox = _bbox_from_mask(out["mask"])
-        if bbox is not None:
-            bbox = _pad_bbox(bbox, W, H)
-            x0, y0, x1, y1 = bbox
-            pred_img = img.crop((x0, y0, x1 + 1, y1 + 1))  # ORIGINAL crop ✅
-            preview = _apply_white_bg(img, out["mask"]).crop((x0, y0, x1 + 1, y1 + 1))
-            out["bbox"] = bbox
-            return pred_img, preview, out
+    out_c = mask_by_corners(img)
+    out_h = mask_by_hsv(img)
 
-    # 2) hsv fallback
-    out2 = mask_by_hsv(img)
-    if out2 is not None and out2["kept_ratio"] >= KEPT_RATIO_MIN:
-        bbox = _bbox_from_mask(out2["mask"])
-        if bbox is not None:
-            bbox = _pad_bbox(bbox, W, H)
-            x0, y0, x1, y1 = bbox
-            pred_img = img.crop((x0, y0, x1 + 1, y1 + 1))  # ORIGINAL crop ✅
-            preview = _apply_white_bg(img, out2["mask"]).crop((x0, y0, x1 + 1, y1 + 1))
-            out2["bbox"] = bbox
-            return pred_img, preview, out2
+    best = None
+    best_score = -1.0
+    best_bbox = None
+    best_bbox_ratio = None
 
-    # 3) final fallback: no masking, no block
-    return img, img, {"kept_ratio": 1.0, "method": "none", "bbox": None}
+    for out in (out_c, out_h):
+        if out is None or float(out.get("kept_ratio", 0.0)) < KEPT_RATIO_MIN:
+            continue
+        score, bbox, bbox_ratio = _score_mask_candidate(out, W, H)
+        if score is None:
+            continue
+        if score > best_score:
+            best_score = score
+            best = out
+            best_bbox = bbox
+            best_bbox_ratio = bbox_ratio
+
+    # If no reliable mask found, do not crop (prevents near-empty crops)
+    MIN_BBOX_AREA_RATIO_FOR_CROP = 0.07
+
+    if best is None or best_bbox is None or (best_bbox_ratio is not None and best_bbox_ratio < MIN_BBOX_AREA_RATIO_FOR_CROP):
+        return img, img, {"kept_ratio": 1.0, "method": "none", "bbox": None}
+
+    x0, y0, x1, y1 = best_bbox
+    pred_img = img.crop((x0, y0, x1 + 1, y1 + 1))  # ORIGINAL crop ✅
+    preview = _apply_white_bg(img, best["mask"]).crop((x0, y0, x1 + 1, y1 + 1))
+
+    info = dict(best)
+    info["bbox"] = best_bbox
+    info["method"] = f"auto|{best.get('method', 'unknown')}"
+    return pred_img, preview, info
 
 
 # -----------------------------
